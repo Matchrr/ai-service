@@ -7,7 +7,8 @@ class Settings(BaseSettings):
     app_name: str = "Matchr AI Service"
     app_env: str = "development"
     api_prefix: str = "/api"
-    cors_origins: str = "http://localhost:3000,http://localhost:8000"
+    cors_origins: str = "http://localhost:3000,http://localhost:4000"
+    port: int = 8080
 
     openai_api_key: str = ""
     anthropic_api_key: str = ""

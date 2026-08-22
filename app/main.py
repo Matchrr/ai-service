@@ -20,3 +20,9 @@ app.include_router(api_router, prefix=settings.api_prefix)
 @app.get("/")
 def root() -> dict[str, str]:
     return {"service": settings.app_name, "docs": "/docs"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app.main:app", host="0.0.0.0", port=settings.port, reload=True)
