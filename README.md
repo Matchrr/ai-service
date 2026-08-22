@@ -16,11 +16,9 @@ Agent and pipeline service for grounding, matching, tailoring, growth plans, eve
 ## Run
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-uvicorn app.main:app --reload --port 8080
+npm run dev
 ```
+
+Creates the virtualenv, installs Python deps, copies `.env` if needed, then starts the agents API.
 
 API docs: http://localhost:8080/docs
