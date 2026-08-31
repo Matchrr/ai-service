@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import math
 import re
-from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,19 +31,36 @@ _JOB_TYPE = {
     "contract": "contract",
     "internship": "internship",
     "seasonal": "seasonal",
-    "internship": "internship",
 }
 
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9+#.]*")
+_SENIORITY = {
+    "junior",
+    "jr",
+    "senior",
+    "sr",
+    "staff",
+    "principal",
+    "lead",
+    "intern",
+    "associate",
+    "mid",
+    "entry",
+}
 
 # Weights for the combined semantic score used to rank retrieved jobs.
-# The raw embedding cosine is the dominant signal; title and skill overlap
-# provide cheap, interpretable corrections when the embedding is noisy.
-_W_EMBEDDING = 0.55
+# Embedding cosine is the retrieval backbone; title/skill/recency correct
+# noisy neighbors. Weights sum to 1.0.
+_W_EMBEDDING = 0.50
 _W_TITLE = 0.15
 _W_SKILLS = 0.20
 _W_WORK_MODE = 0.05
 _W_LOCATION = 0.05
+_W_RECENCY = 0.05
+# Location, work-mode, and recency only refine jobs that already look relevant.
+# Otherwise a Toronto nurse can outrank an Austin software engineer when
+# embeddings collapse or are missing.
+_MIN_CORE_SIGNAL = 0.15
 
 
 def _dense_cosine(left: list[float], right: list[float]) -> float:
@@ -73,7 +89,24 @@ def _norm(value: str | None) -> str:
 
 
 def _tokenize(text: str) -> set[str]:
-    return set(_TOKEN_RE.findall(text.lower()))
+    tokens = set(_TOKEN_RE.findall(text.lower()))
+    stripped = tokens - _SENIORITY
+    return stripped or tokens
+
+
+def _unique_titles(*groups: list[str] | str | None) -> list[str]:
+    titles: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        values = group if isinstance(group, list) else [group]
+        for value in values:
+            title = (value or "").strip()
+            key = title.lower()
+            if not title or key in seen:
+                continue
+            seen.add(key)
+            titles.append(title)
+    return titles
 
 
 def _title_affinity(target_title: str | None, job_title: str | None) -> float:
@@ -87,16 +120,24 @@ def _title_affinity(target_title: str | None, job_title: str | None) -> float:
     return overlap / len(target_tokens)
 
 
+def _best_title_affinity(target_titles: list[str], job_title: str | None) -> float:
+    if not target_titles or not job_title:
+        return 0.0
+    return max(_title_affinity(title, job_title) for title in target_titles)
+
+
 def _skill_overlap(candidate_skills: list[str], job_skills: list[str]) -> float:
+    """How much of the job's required skills the candidate covers.
+
+    Coverage (not Jaccard) so extra candidate skills do not dilute the score.
+    """
     if not candidate_skills or not job_skills:
         return 0.0
     left = {skill.lower().strip() for skill in candidate_skills if skill}
     right = {skill.lower().strip() for skill in job_skills if skill}
     if not left or not right:
         return 0.0
-    intersection = left & right
-    union = left | right
-    return len(intersection) / len(union)
+    return len(left & right) / len(right)
 
 
 def _work_mode_match(row: dict[str, Any], work_modes: list[str] | None) -> float:
@@ -127,14 +168,15 @@ def _location_match(row: dict[str, Any], preferred_location: str | None) -> floa
 
 def _build_query_text(
     profile_text: str,
-    target_title: str | None,
+    target_titles: list[str],
     skills: list[str] | None,
     work_modes: list[str] | None,
     location: str | None,
 ) -> str:
     parts = [profile_text]
-    if target_title:
-        parts.append(f"Target role: {target_title}")
+    if target_titles:
+        label = "Target role" if len(target_titles) == 1 else "Target roles"
+        parts.append(f"{label}: {', '.join(target_titles)}")
     if skills:
         parts.append(f"Skills: {', '.join(skills)}")
     if work_modes:
@@ -203,6 +245,26 @@ def _passes_filters(
     return True
 
 
+def _recency_score(row: dict[str, Any]) -> float:
+    posted = int(row.get("date_posted") or 0)
+    if not posted:
+        return 0.5
+    age_days = max(0.0, (now_ms() - posted) / (24 * 3600 * 1000))
+    if age_days < 1:
+        return 1.0
+    if age_days < 3:
+        return 0.8
+    if age_days < 7:
+        return 0.5
+    if age_days < 14:
+        return 0.25
+    return 0.1
+
+
+def _row_key(row: dict[str, Any]) -> str:
+    return str(row.get("external_id") or "").strip()
+
+
 def _posted_label(row: dict[str, Any]) -> str | None:
     posted = int(row.get("date_posted") or 0)
     if not posted:
@@ -236,9 +298,16 @@ def _salary_label(row: dict[str, Any]) -> str | None:
     return f"{fmt(pay_max or pay_min)}{suffix}"
 
 
-def _to_match(row: dict[str, Any], similarity: float | None, semantic_score: float | None) -> dict[str, Any]:
+def _to_match(
+    row: dict[str, Any],
+    similarity: float | None,
+    semantic_score: float | None,
+    rank: int | None = None,
+) -> dict[str, Any]:
     external_id = str(row.get("external_id") or row.get("id") or "")
-    return {
+    score = None if semantic_score is None else round(semantic_score, 4)
+    ranking_score = None if score is None else int(round(max(0.0, min(score, 1.0)) * 100))
+    payload = {
         "id": external_id,
         "external_id": external_id,
         "xano_id": row.get("id"),
@@ -251,13 +320,17 @@ def _to_match(row: dict[str, Any], similarity: float | None, semantic_score: flo
         "apply_url": row.get("apply_url") or row.get("source_url") or None,
         "description": row.get("job_description") or None,
         "similarity": None if similarity is None else round(similarity, 4),
-        "semantic_score": None if semantic_score is None else round(semantic_score, 4),
+        "semantic_score": score,
+        "ranking_score": ranking_score,
         "work_mode": row.get("work_mode") or None,
         "job_type": row.get("job_type") or None,
         "pay_min": row.get("pay_min") or 0,
         "pay_max": row.get("pay_max") or 0,
         "pay_type": row.get("pay_type") or None,
     }
+    if rank is not None:
+        payload["rank"] = rank
+    return payload
 
 
 class SemanticMatchAgent:
@@ -269,6 +342,7 @@ class SemanticMatchAgent:
         limit: int = 10,
         *,
         target_title: str | None = None,
+        desired_roles: list[str] | None = None,
         profile_text: str = "",
         skills: list[str] | None = None,
         work_modes: list[str] | None = None,
@@ -278,9 +352,12 @@ class SemanticMatchAgent:
         location: str | None = None,
         neighbor_count: int = 50,
     ) -> dict:
+        requested = max(1, int(limit))
+        retrieve_k = max(neighbor_count, requested)
         cutoff = now_ms() - settings.harvest_stale_hours * 3600 * 1000
         filters = _build_filters(cutoff, work_modes, job_types, pay_min, pay_period)
-        query_text = _build_query_text(profile_text, target_title, skills, work_modes, location)
+        target_titles = _unique_titles(target_title, desired_roles)
+        query_text = _build_query_text(profile_text, target_titles, skills, work_modes, location)
         query_vector = embed_text(query_text, task_type="RETRIEVAL_QUERY") if query_text.strip() else []
 
         # 1. Try Xano vector search (custom function). Fall back to brute-force cosine.
@@ -288,7 +365,7 @@ class SemanticMatchAgent:
         vector_source = "brute_force"
         try:
             if query_vector:
-                vector_rows = xano.vector_search_jobs(query_vector, filters=filters, k=neighbor_count)
+                vector_rows = xano.vector_search_jobs(query_vector, filters=filters, k=retrieve_k)
                 if vector_rows is not None:
                     rows = vector_rows
                     vector_source = "xano_vector"
@@ -304,23 +381,34 @@ class SemanticMatchAgent:
                     "agent": self.name,
                     "candidate_id": candidate_id,
                     "matches": [],
-                    "limit": limit,
+                    "limit": requested,
+                    "returned": 0,
                     "source": "error",
                 }
 
         # 2. Filter to active, recent, and user-selected constraints.
-        pool: list[dict[str, Any]] = []
-        for row in rows:
-            if str(row.get("status") or "") != "active":
-                continue
-            last_seen = int(row.get("last_seen_at") or 0)
-            if last_seen < cutoff:
-                continue
-            if not str(row.get("external_id") or "").strip():
-                continue
-            if not _passes_filters(row, work_modes, job_types, pay_min, pay_period):
-                continue
-            pool.append(row)
+        pool = self._filter_pool(rows, cutoff, work_modes, job_types, pay_min, pay_period)
+
+        # Vector neighbors can be narrower than the live catalog. If that leaves
+        # fewer than N eligible jobs, union in previously harvested rows.
+        if len(pool) < requested and vector_source == "xano_vector":
+            try:
+                catalog = xano.list_jobs()
+            except XanoError:
+                logger.exception("Match could not list Xano jobs to fill the requested count")
+            else:
+                seen = {_row_key(row) for row in pool}
+                extra = self._filter_pool(catalog, cutoff, work_modes, job_types, pay_min, pay_period)
+                added = 0
+                for row in extra:
+                    key = _row_key(row)
+                    if not key or key in seen:
+                        continue
+                    pool.append(row)
+                    seen.add(key)
+                    added += 1
+                if added:
+                    vector_source = "xano_vector+catalog"
 
         # 3. Score and rank with embedding cosine + semantic signals.
         candidate_skills = skills or []
@@ -331,10 +419,15 @@ class SemanticMatchAgent:
                 _dense_cosine(query_vector, job_vector) if query_vector and job_vector else 0.0
             )
 
-            title_sim = _title_affinity(target_title, row.get("job_position_name"))
+            title_sim = _best_title_affinity(target_titles, row.get("job_position_name"))
             skill_sim = _skill_overlap(candidate_skills, row.get("required_skills") or [])
-            mode_sim = _work_mode_match(row, work_modes)
-            loc_sim = _location_match(row, location)
+            core_signal = max(embedding_similarity, title_sim, skill_sim)
+            if core_signal >= _MIN_CORE_SIGNAL:
+                mode_sim = _work_mode_match(row, work_modes)
+                loc_sim = _location_match(row, location)
+                recency_sim = _recency_score(row)
+            else:
+                mode_sim = loc_sim = recency_sim = 0.0
 
             semantic_score = (
                 _W_EMBEDDING * embedding_similarity
@@ -342,19 +435,51 @@ class SemanticMatchAgent:
                 + _W_SKILLS * skill_sim
                 + _W_WORK_MODE * mode_sim
                 + _W_LOCATION * loc_sim
+                + _W_RECENCY * recency_sim
             )
             scored.append((semantic_score, embedding_similarity, row))
 
         scored.sort(key=lambda item: -item[0])
-        top = scored[: max(neighbor_count, limit)]
-        matches = [_to_match(row, embedding_similarity, semantic_score) for semantic_score, embedding_similarity, row in top]
+        top = scored[:requested]
+        matches = [
+            _to_match(row, embedding_similarity, semantic_score, rank=index)
+            for index, (semantic_score, embedding_similarity, row) in enumerate(top, start=1)
+        ]
         return {
             "agent": self.name,
             "candidate_id": candidate_id,
-            "target_title": target_title,
+            "target_title": target_titles[0] if target_titles else target_title,
+            "desired_roles": target_titles,
             "matches": matches,
-            "limit": limit,
+            "limit": requested,
+            "returned": len(matches),
             "pool_size": len(pool),
             "source": vector_source,
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
+
+    @staticmethod
+    def _filter_pool(
+        rows: list[dict[str, Any]],
+        cutoff: int,
+        work_modes: list[str] | None,
+        job_types: list[str] | None,
+        pay_min: float | None,
+        pay_period: str | None,
+    ) -> list[dict[str, Any]]:
+        pool: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            if str(row.get("status") or "") != "active":
+                continue
+            last_seen = int(row.get("last_seen_at") or 0)
+            if last_seen < cutoff:
+                continue
+            key = _row_key(row)
+            if not key or key in seen:
+                continue
+            if not _passes_filters(row, work_modes, job_types, pay_min, pay_period):
+                continue
+            seen.add(key)
+            pool.append(row)
+        return pool

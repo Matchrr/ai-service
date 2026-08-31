@@ -16,7 +16,7 @@ from app.core.config import settings
 from app.db.xano import XanoError, xano
 from app.lib.skills import extract_skills
 from app.pipelines.embeddings import embed_texts
-from app.pipelines.queries import CHIPS_WEEK, SearchQuery, allocate_standing_queries, expand_queries
+from app.pipelines.queries import CHIPS_WEEK, SearchQuery, allocate_standing_queries, expand_queries_for_roles
 
 logger = logging.getLogger(__name__)
 
@@ -848,9 +848,15 @@ def fanout_jobs(
     location: str | None = None,
     top_skill: str | None = None,
     work_modes: list[str] | None = None,
+    desired_roles: list[str] | None = None,
 ) -> dict[str, Any]:
     title = (target_title or "").strip()
-    if not title:
+    roles = [title] if title else []
+    for extra in desired_roles or []:
+        value = (extra or "").strip()
+        if value and value.lower() not in {item.lower() for item in roles}:
+            roles.append(value)
+    if not roles:
         raise ValueError("Set a target role so we can pull live jobs")
     if not settings.live_harvest_enabled:
         return {
@@ -863,7 +869,7 @@ def fanout_jobs(
             "at": iso_now(),
             "source": "unconfigured",
         }
-    queries = expand_queries(title, location, top_skill, work_modes)
+    queries = expand_queries_for_roles(roles, location, top_skill, work_modes)
     return harvest_queries(queries, mode="fanout", cache_hours=settings.harvest_cache_hours)
 
 

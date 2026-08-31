@@ -39,17 +39,21 @@ def _job_row(
     required_skills=None,
     location="Remote",
     embedding=None,
+    date_posted_hours=12,
+    company="Acme",
 ):
     now = int(time.time() * 1000)
+    posted = now - date_posted_hours * 3600 * 1000 if date_posted_hours is not None else 0
     return {
         "id": job_id,
         "external_id": f"ext-{job_id}",
         "job_position_name": title,
-        "company_name": "Acme",
+        "company_name": company,
         "location": location,
         "job_description": "Build systems.",
         "status": status,
         "last_seen_at": now - last_seen_hours * 3600 * 1000,
+        "date_posted": posted,
         "work_mode": work_mode,
         "job_type": job_type,
         "pay_min": pay_min,
@@ -169,7 +173,7 @@ def test_match_uses_xano_vector_search_when_configured(xano_mock, embed_mock, ai
     xano_mock.list_jobs.return_value = []  # should not be used
 
     result = SemanticMatchAgent().run(
-        "cand-1", 10, profile_text="software engineer python", target_title="Software Engineer"
+        "cand-1", 2, profile_text="software engineer python", target_title="Software Engineer"
     )
     assert result["source"] == "xano_vector"
     assert result["pool_size"] == 2
@@ -239,3 +243,172 @@ def test_match_vector_search_called_with_filters(ai_settings, xano_mock, embed_m
     assert "last_seen_at" in call_kwargs["filters"]
     assert call_kwargs["filters"]["work_mode"]["in"] == ["remote"]
     assert call_kwargs["filters"]["job_type"]["in"] == ["full_time"]
+
+
+def test_match_limit_is_a_hard_cap(xano_mock, embed_mock, settings_mock):
+    xano_mock.list_jobs.return_value = [_job_row(i) for i in range(1, 21)]
+    result = SemanticMatchAgent().run("cand-1", 10, profile_text="software engineer")
+    assert result["limit"] == 10
+    assert result["returned"] == 10
+    assert len(result["matches"]) == 10
+    assert [match["rank"] for match in result["matches"]] == list(range(1, 11))
+
+
+def test_match_limit_five_and_fifteen(xano_mock, embed_mock, settings_mock):
+    xano_mock.list_jobs.return_value = [_job_row(i) for i in range(1, 40)]
+    five = SemanticMatchAgent().run("cand-1", 5, profile_text="software engineer")
+    fifteen = SemanticMatchAgent().run("cand-1", 15, profile_text="software engineer")
+    assert len(five["matches"]) == 5
+    assert five["returned"] == 5
+    assert len(fifteen["matches"]) == 15
+    assert fifteen["returned"] == 15
+
+
+def test_match_returns_pool_when_smaller_than_limit(xano_mock, embed_mock, settings_mock):
+    xano_mock.list_jobs.return_value = [_job_row(1), _job_row(2), _job_row(3)]
+    result = SemanticMatchAgent().run("cand-1", 10, profile_text="software engineer")
+    assert result["returned"] == 3
+    assert len(result["matches"]) == 3
+    assert result["limit"] == 10
+
+
+def test_match_does_not_return_neighbor_count(xano_mock, embed_mock, settings_mock):
+    xano_mock.list_jobs.return_value = [_job_row(i) for i in range(1, 60)]
+    result = SemanticMatchAgent().run("cand-1", 10, profile_text="software engineer")
+    assert len(result["matches"]) == 10
+    assert result["returned"] == 10
+
+
+def test_match_fills_short_vector_results_from_catalog(xano_mock, embed_mock, ai_settings):
+    ai_settings(xano_match_endpoint="match_jobs", harvest_stale_hours=96)
+    xano_mock.vector_search_jobs.return_value = [_job_row(1), _job_row(2)]
+    xano_mock.list_jobs.return_value = [_job_row(i) for i in range(1, 12)]
+
+    result = SemanticMatchAgent().run("cand-1", 10, profile_text="software engineer")
+    assert result["returned"] == 10
+    assert result["source"] == "xano_vector+catalog"
+    assert xano_mock.list_jobs.called
+
+
+def test_match_ranks_best_title_and_skills_first(xano_mock, embed_mock, settings_mock):
+    xano_mock.list_jobs.return_value = [
+        _job_row(1, title="Marketing Manager", required_skills=["SEO", "Content"]),
+        _job_row(2, title="Software Engineer", required_skills=["Python", "AWS"], location="Toronto, ON"),
+        _job_row(3, title="Data Scientist", required_skills=["R", "SPSS"]),
+        _job_row(4, title="Software Engineer", required_skills=["Java", "Spring"]),
+        _job_row(5, title="Account Executive", required_skills=["Salesforce"]),
+    ]
+    result = SemanticMatchAgent().run(
+        "cand-1",
+        3,
+        profile_text="software engineer python aws",
+        target_title="Software Engineer",
+        skills=["Python", "AWS"],
+        location="Toronto, ON",
+    )
+    assert result["returned"] == 3
+    assert result["matches"][0]["title"] == "Software Engineer"
+    assert result["matches"][0]["location"] == "Toronto, ON"
+    assert result["matches"][0]["rank"] == 1
+    assert result["matches"][0]["ranking_score"] >= result["matches"][1]["ranking_score"]
+    scores = [match["semantic_score"] for match in result["matches"]]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_match_uses_all_desired_roles_for_title_affinity(xano_mock, embed_mock, settings_mock):
+    xano_mock.list_jobs.return_value = [
+        _job_row(1, title="Marketing Manager", required_skills=["SEO"]),
+        _job_row(2, title="Data Scientist", required_skills=["Python"]),
+        _job_row(3, title="Nurse Practitioner", required_skills=["Clinical"]),
+    ]
+    result = SemanticMatchAgent().run(
+        "cand-1",
+        2,
+        profile_text="data scientist python",
+        target_title="Software Engineer",
+        desired_roles=["Data Scientist"],
+        skills=["Python"],
+    )
+    assert result["matches"][0]["title"] == "Data Scientist"
+    assert "Data Scientist" in result["desired_roles"]
+
+
+def test_match_skill_coverage_does_not_punish_extra_candidate_skills(
+    xano_mock, embed_mock, settings_mock
+):
+    xano_mock.list_jobs.return_value = [
+        _job_row(1, title="Software Engineer", required_skills=["Python"]),
+        _job_row(2, title="Marketing Manager", required_skills=["SEO"]),
+    ]
+    many_skills = ["Python", "AWS", "Docker", "Kubernetes", "React", "SQL"]
+    result = SemanticMatchAgent().run(
+        "cand-1",
+        2,
+        profile_text="software engineer",
+        target_title="Software Engineer",
+        skills=many_skills,
+    )
+    assert result["matches"][0]["title"] == "Software Engineer"
+    assert result["matches"][0]["semantic_score"] > result["matches"][1]["semantic_score"]
+
+
+def test_match_prefers_fresher_role_when_other_signals_tie(xano_mock, embed_mock, settings_mock):
+    xano_mock.list_jobs.return_value = [
+        _job_row(1, title="Software Engineer", date_posted_hours=200),
+        _job_row(2, title="Software Engineer", date_posted_hours=2),
+    ]
+    result = SemanticMatchAgent().run(
+        "cand-1", 2, profile_text="software engineer", target_title="Software Engineer"
+    )
+    assert result["matches"][0]["id"] == "ext-2"
+
+
+def test_match_vector_search_requests_at_least_limit(xano_mock, embed_mock, ai_settings):
+    ai_settings(xano_match_endpoint="match_jobs", harvest_stale_hours=96)
+    xano_mock.vector_search_jobs.return_value = [_job_row(i) for i in range(1, 16)]
+    SemanticMatchAgent().run("cand-1", 15, profile_text="software engineer")
+    assert xano_mock.vector_search_jobs.call_args[1]["k"] >= 15
+
+
+def test_ranking_evaluation_gold_set(xano_mock, embed_mock, settings_mock):
+    """Synthetic retrieval quality check used by the matching audit.
+
+    A Python/AWS software engineer in Toronto asks for 5 roles. Embeddings
+    separate true engineering neighbors from unrelated occupations; title,
+    skills, and location then break ties inside the engineering cluster.
+    """
+    on_query = [1.0] + [0.0] * 1535
+    adjacent = [0.65] + [0.35] + [0.0] * 1534
+    unrelated = [0.0, 1.0] + [0.0] * 1534
+    xano_mock.list_jobs.return_value = [
+        _job_row(1, title="Marketing Manager", required_skills=["SEO", "Content"], location="New York, NY", embedding=unrelated),
+        _job_row(2, title="Software Engineer", required_skills=["Python", "AWS"], location="Toronto, ON", embedding=on_query),
+        _job_row(3, title="Account Executive", required_skills=["Salesforce"], location="Remote", embedding=unrelated),
+        _job_row(4, title="Senior Software Engineer", required_skills=["Java"], location="Remote", embedding=on_query),
+        _job_row(5, title="Data Scientist", required_skills=["Python"], location="Toronto, ON", embedding=adjacent),
+        _job_row(6, title="Nurse Practitioner", required_skills=["Clinical"], location="Toronto, ON", embedding=unrelated),
+        _job_row(7, title="Software Engineer", required_skills=["Go"], location="Austin, TX", embedding=on_query),
+        _job_row(8, title="Product Manager", required_skills=["Roadmapping"], location="Remote", embedding=unrelated),
+        _job_row(9, title="Full Stack Engineer", required_skills=["Python", "React"], location="Remote", embedding=on_query),
+    ]
+    result = SemanticMatchAgent().run(
+        "cand-1",
+        5,
+        profile_text="software engineer python aws toronto",
+        target_title="Software Engineer",
+        skills=["Python", "AWS"],
+        location="Toronto, ON",
+        work_modes=["remote", "hybrid"],
+    )
+    titles = [match["title"] for match in result["matches"]]
+    assert result["returned"] == 5
+    assert titles[0] == "Software Engineer"
+    assert result["matches"][0]["location"] == "Toronto, ON"
+    assert "Marketing Manager" not in titles
+    assert "Account Executive" not in titles
+    assert "Nurse Practitioner" not in titles
+    assert "Product Manager" not in titles
+    assert all(
+        result["matches"][index]["semantic_score"] >= result["matches"][index + 1]["semantic_score"]
+        for index in range(len(result["matches"]) - 1)
+    )

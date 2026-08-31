@@ -5,6 +5,7 @@ from app.pipelines.queries import (
     SearchQuery,
     allocate_standing_queries,
     expand_queries,
+    expand_queries_for_roles,
 )
 
 
@@ -158,3 +159,36 @@ def test_allocate_standing_queries_no_duplicate_pairs():
     queries = allocate_standing_queries(demand, budget=20)
     # Each (q, location) pair should be unique.
     assert len(queries) == len({(q.q, q.location) for q in queries})
+
+
+def test_expand_queries_for_roles_single_title_matches_original():
+    original = expand_queries("Backend Engineer", "Toronto, ON", "Python")
+    multi = expand_queries_for_roles(["Backend Engineer"], "Toronto, ON", "Python")
+    assert [(q.q, q.location) for q in multi] == [(q.q, q.location) for q in original]
+
+
+def test_expand_queries_for_roles_covers_each_title_within_budget():
+    queries = expand_queries_for_roles(
+        ["Software Engineer", "Data Scientist", "Product Manager"],
+        "Toronto, ON",
+        "Python",
+        work_modes=["remote", "hybrid"],
+        budget=4,
+    )
+    assert len(queries) <= 4
+    texts = {q.q.lower() for q in queries}
+    assert "software engineer" in texts
+    assert "data scientist" in texts
+    assert "product manager" in texts
+
+
+def test_expand_queries_for_roles_caps_at_four():
+    queries = expand_queries_for_roles(
+        ["Software Engineer", "Data Scientist"],
+        "Toronto, ON",
+        "Python",
+        work_modes=["hybrid"],
+        budget=4,
+    )
+    assert len(queries) <= 4
+    assert len({q.key() for q in queries}) == len(queries)

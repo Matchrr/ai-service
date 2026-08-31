@@ -21,6 +21,7 @@ class FanoutRequest(BaseModel):
     location: str | None = None
     top_skill: str | None = None
     work_modes: list[str] | None = None
+    desired_roles: list[str] | None = None
 
 
 class ChunkSyncRequest(BaseModel):
@@ -50,6 +51,7 @@ def harvest_fanout(payload: FanoutRequest) -> dict:
             payload.location,
             payload.top_skill,
             payload.work_modes,
+            payload.desired_roles,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

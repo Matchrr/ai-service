@@ -219,6 +219,60 @@ def expand_queries(
     return unique
 
 
+def expand_queries_for_roles(
+    titles: list[str],
+    location: str | None,
+    skill: str | None,
+    work_modes: list[str] | None = None,
+    budget: int = 4,
+) -> list[SearchQuery]:
+    """Distribute the fan-out budget across every desired role.
+
+    One title keeps the original 4-slot expansion. Multiple titles each get an
+    exact query first; leftover slots go to location-omit, adjacent, and skill
+    expansions of the primary role.
+    """
+    cleaned: list[str] = []
+    seen_titles: set[str] = set()
+    for title in titles:
+        value = (title or "").strip()
+        key = value.lower()
+        if not value or key in seen_titles:
+            continue
+        seen_titles.add(key)
+        cleaned.append(value)
+    if not cleaned:
+        return []
+    if len(cleaned) == 1:
+        return expand_queries(cleaned[0], location, skill, work_modes)[:budget]
+
+    remote_only = is_remote_only(location, work_modes)
+    city = None if remote_only or not location or is_remote_location(location) else location.strip()
+
+    pairs: list[SearchQuery] = []
+    for title in cleaned:
+        pairs.append(SearchQuery(title, None if remote_only else city))
+    if not remote_only and city:
+        pairs.append(SearchQuery(cleaned[0], None))
+    adjacent = adjacent_title(cleaned[0])
+    if adjacent and adjacent.lower() != cleaned[0].lower():
+        pairs.append(SearchQuery(adjacent, None if remote_only else city))
+    if skill and skill.strip():
+        pairs.append(SearchQuery(f"{cleaned[0]} {skill.strip()}", None if remote_only else city))
+
+    seen: set[tuple[str, str]] = set()
+    unique: list[SearchQuery] = []
+    for query in pairs:
+        key = query.key()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(query)
+        if len(unique) >= budget:
+            break
+    return unique
+
+
 def allocate_standing_queries(
     demand: dict,
     budget: int = 20,

@@ -23,6 +23,7 @@ class CandidateJobRequest(BaseModel):
     candidate_id: str
     job_id: str | None = None
     target_title: str | None = None
+    desired_roles: list[str] = Field(default_factory=list)
     limit: int = 10
     profile_text: str = ""
     skills: list[str] = Field(default_factory=list)
@@ -66,6 +67,7 @@ def match_jobs(payload: CandidateJobRequest) -> dict:
         payload.candidate_id,
         payload.limit,
         target_title=payload.target_title,
+        desired_roles=payload.desired_roles,
         profile_text=payload.profile_text,
         skills=payload.skills,
         work_modes=payload.work_modes,
